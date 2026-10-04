@@ -5,19 +5,22 @@
  * - 首次打开自动播种三层互相引用的演示数据（幂等）
  * 纯前端应用：不依赖任何后端服务或数据库。
  */
-import Dexie, { type Table } from 'dexie'
+import Dexie, { type Table, type Transaction } from 'dexie'
 import type { Book } from '@/types/book'
 import type { Volume } from '@/types/volume'
 import type { Leaf } from '@/types/leaf'
 import { DEFAULT_DYE_RECIPE, type Paper } from '@/types/paper'
 import type { RepairOrder } from '@/types/repairOrder'
 import type { Binding } from '@/types/binding'
+import type { Workshop } from '@/types/workshop'
+import type { SendRegistration } from '@/types/sendRegistration'
+import type { ReturnSlip } from '@/types/returnSlip'
 
 /** 数据库名（README 与导出文件均使用该名称） */
 export const DB_NAME = 'gbbookrestore'
 
 /** 当前数据结构版本号 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** localStorage 侧少量元数据键 */
 export const LS_KEYS = {
@@ -88,6 +91,9 @@ export class BookRestoreDatabase extends Dexie {
   papers!: Table<Paper, string>
   repairOrders!: Table<RepairOrder, string>
   bindings!: Table<Binding, string>
+  workshops!: Table<Workshop, string>
+  sendRegistrations!: Table<SendRegistration, string>
+  returnSlips!: Table<ReturnSlip, string>
 
   constructor() {
     super(DB_NAME)
@@ -101,7 +107,7 @@ export class BookRestoreDatabase extends Dexie {
       bindings: 'id, volumeId, verdict, finishDate, updatedAt'
     })
     // v2：Paper 增加 dyeRecipe 字段，按纸种为历史记录回填默认配方
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         books: 'id, title, era, level, collectionNo, updatedAt',
         volumes: 'id, bookId, volumeNo, bindingType, state, updatedAt',
@@ -122,6 +128,23 @@ export class BookRestoreDatabase extends Dexie {
             if (typeof paper.thicknessMm !== 'number') paper.thicknessMm = 0.06
           })
       })
+    // v3：新增馆外工坊、送修登记、回件单三张表；
+    // 老档案里在外的叶没有批次归属，升级时按送修日期和工坊回填，补不上的只读留着。
+    this.version(3)
+      .stores({
+        books: 'id, title, era, level, collectionNo, updatedAt',
+        volumes: 'id, bookId, volumeNo, bindingType, state, updatedAt',
+        leaves: 'id, volumeId, leafNo, damageType, phValue, state, readOnly, updatedAt',
+        papers: 'id, leafId, paperType, laidPattern, deltaE, updatedAt',
+        repairOrders: 'id, leafId, seq, name, operator, state, updatedAt',
+        bindings: 'id, volumeId, method, verdict, finishDate, updatedAt',
+        workshops: 'id, name, updatedAt',
+        sendRegistrations: 'id, batchNo, workshopId, sendDate, agreedReturnDate, updatedAt',
+        returnSlips: 'id, batchId, workshopId, returnDate, reconcileStatus, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        await backfillOutsideLeaves(tx)
+      })
   }
 }
 
@@ -131,6 +154,79 @@ export const db = new BookRestoreDatabase()
 export function createId(prefix: string): string {
   const rand = Math.random().toString(36).slice(2, 8)
   return `${prefix}_${Date.now().toString(36)}${rand}`
+}
+
+/**
+ * v2→v3 升级迁移：回填在外叶的批次归属。
+ * 老档案里在外的叶（state=repairing）没有批次归属，
+ * 升级时按送修日期（leaf.updatedAt）和工坊回填到送修登记；
+ * 补不上的（日期非法等）标记 readOnly 只读留着，不可编辑。
+ */
+export async function backfillOutsideLeaves(tx: Transaction): Promise<void> {
+  const leafTable = tx.table<Leaf>('leaves')
+  const workshopTable = tx.table<Workshop>('workshops')
+  const sendTable = tx.table<SendRegistration>('sendRegistrations')
+
+  // 确保有一个默认工坊可挂
+  let workshop = await workshopTable.orderBy('updatedAt').first()
+  if (!workshop) {
+    workshop = {
+      id: createId('workshop'),
+      name: '苏州古籍修复工坊',
+      contact: '',
+      note: 'v3 升级时为在外叶回填批次而建',
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    }
+    await workshopTable.put(workshop)
+  }
+
+  const leaves = await leafTable.toArray()
+  let batchCounter = 1
+  const now = Date.now()
+
+  for (const leaf of leaves) {
+    // 只处理在外（修复中）且未标记只读的叶
+    if (leaf.state !== 'repairing' || leaf.readOnly) continue
+
+    // 送修日期取叶的最近更新时间；非法则补不上，只读留着
+    const sendDate = new Date(leaf.updatedAt)
+    if (Number.isNaN(sendDate.getTime())) {
+      await leafTable.update(leaf.id, { readOnly: true, updatedAt: now })
+      continue
+    }
+    const sendDateStr = sendDate.toISOString().slice(0, 10)
+
+    // 按送修日期 + 工坊匹配已有批次，匹配到就补进去
+    const existing = await sendTable
+      .where('workshopId')
+      .equals(workshop.id)
+      .and((s: SendRegistration) => s.sendDate === sendDateStr)
+      .first()
+
+    if (existing) {
+      if (!existing.leafIds.includes(leaf.id)) {
+        existing.leafIds.push(leaf.id)
+        existing.updatedAt = now
+        await sendTable.put(existing)
+      }
+    } else {
+      // 匹配不到就新建一条送修登记（回填）
+      const agreed = new Date(sendDate.getTime() + 30 * 86400000).toISOString().slice(0, 10)
+      await sendTable.put({
+        id: createId('send'),
+        batchNo: `SX-${sendDate.getFullYear()}-${String(batchCounter).padStart(3, '0')}`,
+        workshopId: workshop.id,
+        leafIds: [leaf.id],
+        sendDate: sendDateStr,
+        agreedReturnDate: agreed,
+        note: 'v3 升级回填',
+        createdAt: now,
+        updatedAt: now
+      })
+      batchCounter += 1
+    }
+  }
 }
 
 /** 打开数据库并在首次使用时播种演示数据（幂等） */
@@ -193,14 +289,15 @@ export async function seedDatabase(): Promise<void> {
   ]
 
   const leaves: Leaf[] = [
-    { id: 'leaf_010101', volumeId: 'vol_0101', leafNo: 3, damageType: 'worm', damageAreaCm2: 6.5, phValue: 6.4, state: 'repairing', createdAt: now - day * 20, updatedAt: now - day * 3 },
-    { id: 'leaf_010102', volumeId: 'vol_0101', leafNo: 8, damageType: 'acid', damageAreaCm2: 12.2, phValue: 5.1, state: 'pending', createdAt: now - day * 20, updatedAt: now - day * 4 },
-    { id: 'leaf_010103', volumeId: 'vol_0101', leafNo: 8, damageType: 'stain', damageAreaCm2: 4.8, phValue: 6.1, state: 'pending', createdAt: now - day * 19, updatedAt: now - day * 4 },
-    { id: 'leaf_010201', volumeId: 'vol_0102', leafNo: 2, damageType: 'loss', damageAreaCm2: 9.4, phValue: 6.7, state: 'pending', createdAt: now - day * 18, updatedAt: now - day * 6 },
-    { id: 'leaf_020101', volumeId: 'vol_0201', leafNo: 5, damageType: 'fibrin', damageAreaCm2: 15.6, phValue: 6.9, state: 'repaired', createdAt: now - day * 25, updatedAt: now - day * 2 },
-    { id: 'leaf_020102', volumeId: 'vol_0201', leafNo: 11, damageType: 'worm', damageAreaCm2: 7.2, phValue: 6.6, state: 'repaired', createdAt: now - day * 24, updatedAt: now - day * 3 },
-    { id: 'leaf_030101', volumeId: 'vol_0301', leafNo: 1, damageType: 'acid', damageAreaCm2: 20.5, phValue: 4.8, state: 'repaired', createdAt: now - day * 50, updatedAt: now - day * 5 },
-    { id: 'leaf_030102', volumeId: 'vol_0301', leafNo: 6, damageType: 'loss', damageAreaCm2: 11.1, phValue: 5.6, state: 'repaired', createdAt: now - day * 49, updatedAt: now - day * 6 }
+    { id: 'leaf_010101', volumeId: 'vol_0101', leafNo: 3, damageType: 'worm', damageAreaCm2: 6.5, phValue: 6.4, state: 'repairing', readOnly: false, createdAt: now - day * 20, updatedAt: now - day * 3 },
+    { id: 'leaf_010102', volumeId: 'vol_0101', leafNo: 8, damageType: 'acid', damageAreaCm2: 12.2, phValue: 5.1, state: 'pending', readOnly: false, createdAt: now - day * 20, updatedAt: now - day * 4 },
+    { id: 'leaf_010103', volumeId: 'vol_0101', leafNo: 8, damageType: 'stain', damageAreaCm2: 4.8, phValue: 6.1, state: 'pending', readOnly: false, createdAt: now - day * 19, updatedAt: now - day * 4 },
+    { id: 'leaf_010104', volumeId: 'vol_0101', leafNo: 12, damageType: 'worm', damageAreaCm2: 3.2, phValue: 6.0, state: 'repairing', readOnly: true, createdAt: now - day * 40, updatedAt: now - day * 35 },
+    { id: 'leaf_010201', volumeId: 'vol_0102', leafNo: 2, damageType: 'loss', damageAreaCm2: 9.4, phValue: 6.7, state: 'pending', readOnly: false, createdAt: now - day * 18, updatedAt: now - day * 6 },
+    { id: 'leaf_020101', volumeId: 'vol_0201', leafNo: 5, damageType: 'fibrin', damageAreaCm2: 15.6, phValue: 6.9, state: 'repaired', readOnly: false, createdAt: now - day * 25, updatedAt: now - day * 2 },
+    { id: 'leaf_020102', volumeId: 'vol_0201', leafNo: 11, damageType: 'worm', damageAreaCm2: 7.2, phValue: 6.6, state: 'repaired', readOnly: false, createdAt: now - day * 24, updatedAt: now - day * 3 },
+    { id: 'leaf_030101', volumeId: 'vol_0301', leafNo: 1, damageType: 'acid', damageAreaCm2: 20.5, phValue: 4.8, state: 'repaired', readOnly: false, createdAt: now - day * 50, updatedAt: now - day * 5 },
+    { id: 'leaf_030102', volumeId: 'vol_0301', leafNo: 6, damageType: 'loss', damageAreaCm2: 11.1, phValue: 5.6, state: 'repaired', readOnly: false, createdAt: now - day * 49, updatedAt: now - day * 6 }
   ]
 
   const papers: Paper[] = [
@@ -230,9 +327,70 @@ export async function seedDatabase(): Promise<void> {
     { id: 'bind_0101', volumeId: 'vol_0101', method: '四眼线装', finishDate: '2026-03-10', verdict: 'rework', inspector: '程砚', createdAt: now - day * 2, updatedAt: now - day * 2 }
   ]
 
+  /* 馆外工坊：本室做不完的册送去做整册托裱，两边各记各的 */
+  const workshops: Workshop[] = [
+    { id: 'workshop_01', name: '苏州古籍修复工坊', contact: '苏州市姑苏区 · 顾师傅', note: '擅长整册托裱与金镶玉装', createdAt: now - day * 30, updatedAt: now - day * 30 },
+    { id: 'workshop_02', name: '扬州修书坊', contact: '扬州市广陵区 · 方师傅', note: '擅长蝴蝶装与包背装复原', createdAt: now - day * 25, updatedAt: now - day * 25 }
+  ]
+
+  /* 送修登记（本室那本）：送去哪几叶、交给哪家工坊、约定哪天交回 */
+  const sendRegistrations: SendRegistration[] = [
+    {
+      id: 'send_01',
+      batchNo: 'SX-2026-001',
+      workshopId: 'workshop_01',
+      leafIds: ['leaf_010101'],
+      sendDate: new Date(now - day * 15).toISOString().slice(0, 10),
+      agreedReturnDate: new Date(now + day * 15).toISOString().slice(0, 10),
+      note: '整册托裱，虫蛀叶需补破后托裱',
+      createdAt: now - day * 15,
+      updatedAt: now - day * 15
+    },
+    {
+      id: 'send_02',
+      batchNo: 'SX-2026-002',
+      workshopId: 'workshop_02',
+      leafIds: ['leaf_010102', 'leaf_010103'],
+      sendDate: new Date(now - day * 45).toISOString().slice(0, 10),
+      agreedReturnDate: new Date(now - day * 5).toISOString().slice(0, 10),
+      note: '酸化叶托裱，已过约定交期',
+      createdAt: now - day * 45,
+      updatedAt: now - day * 45
+    },
+    {
+      id: 'send_03',
+      batchNo: 'SX-2026-003',
+      workshopId: 'workshop_01',
+      leafIds: ['leaf_010201'],
+      sendDate: new Date(now - day * 20).toISOString().slice(0, 10),
+      agreedReturnDate: new Date(now - day * 2).toISOString().slice(0, 10),
+      note: '缺肉叶补破托裱，已交回',
+      createdAt: now - day * 20,
+      updatedAt: now - day * 20
+    }
+  ]
+
+  /* 回件单（工坊那本）：交回日期、实际交了哪几叶、返工说明 */
+  const returnSlips: ReturnSlip[] = [
+    {
+      id: 'return_01',
+      batchId: 'send_03',
+      workshopId: 'workshop_01',
+      returnDate: new Date(now - day * 2).toISOString().slice(0, 10),
+      leafIds: ['leaf_010201'],
+      reworkNote: '补破处已托裱，待本室验收',
+      reconcileStatus: 'matched',
+      claimNote: '',
+      claimedBy: '',
+      claimedAt: null,
+      createdAt: now - day * 2,
+      updatedAt: now - day * 2
+    }
+  ]
+
   await db.transaction(
     'rw',
-    [db.books, db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings],
+    [db.books, db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings, db.workshops, db.sendRegistrations, db.returnSlips],
     async () => {
       await db.books.bulkPut(books)
       await db.volumes.bulkPut(volumes)
@@ -240,6 +398,9 @@ export async function seedDatabase(): Promise<void> {
       await db.papers.bulkPut(papers)
       await db.repairOrders.bulkPut(repairOrders)
       await db.bindings.bulkPut(bindings)
+      await db.workshops.bulkPut(workshops)
+      await db.sendRegistrations.bulkPut(sendRegistrations)
+      await db.returnSlips.bulkPut(returnSlips)
     }
   )
 }
@@ -256,17 +417,24 @@ export interface RestoreSnapshot {
   papers: Paper[]
   repairOrders: RepairOrder[]
   bindings: Binding[]
+  workshops: Workshop[]
+  sendRegistrations: SendRegistration[]
+  returnSlips: ReturnSlip[]
 }
 
 export async function exportSnapshot(): Promise<RestoreSnapshot> {
-  const [books, volumes, leaves, papers, repairOrders, bindings] = await Promise.all([
-    db.books.toArray(),
-    db.volumes.toArray(),
-    db.leaves.toArray(),
-    db.papers.toArray(),
-    db.repairOrders.toArray(),
-    db.bindings.toArray()
-  ])
+  const [books, volumes, leaves, papers, repairOrders, bindings, workshops, sendRegistrations, returnSlips] =
+    await Promise.all([
+      db.books.toArray(),
+      db.volumes.toArray(),
+      db.leaves.toArray(),
+      db.papers.toArray(),
+      db.repairOrders.toArray(),
+      db.bindings.toArray(),
+      db.workshops.toArray(),
+      db.sendRegistrations.toArray(),
+      db.returnSlips.toArray()
+    ])
   return {
     app: DB_NAME,
     schemaVersion: DB_VERSION,
@@ -276,7 +444,10 @@ export async function exportSnapshot(): Promise<RestoreSnapshot> {
     leaves,
     papers,
     repairOrders,
-    bindings
+    bindings,
+    workshops,
+    sendRegistrations,
+    returnSlips
   }
 }
 
@@ -291,7 +462,10 @@ export function validateSnapshot(input: unknown): string {
     'leaves',
     'papers',
     'repairOrders',
-    'bindings'
+    'bindings',
+    'workshops',
+    'sendRegistrations',
+    'returnSlips'
   ]
   for (const key of keys) {
     if (!Array.isArray(snapshot[key])) return `备份文件缺少 ${String(key)} 集合`
@@ -302,7 +476,7 @@ export function validateSnapshot(input: unknown): string {
 export async function importSnapshot(snapshot: RestoreSnapshot): Promise<void> {
   await db.transaction(
     'rw',
-    [db.books, db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings],
+    [db.books, db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings, db.workshops, db.sendRegistrations, db.returnSlips],
     async () => {
       await Promise.all([
         db.books.clear(),
@@ -310,7 +484,10 @@ export async function importSnapshot(snapshot: RestoreSnapshot): Promise<void> {
         db.leaves.clear(),
         db.papers.clear(),
         db.repairOrders.clear(),
-        db.bindings.clear()
+        db.bindings.clear(),
+        db.workshops.clear(),
+        db.sendRegistrations.clear(),
+        db.returnSlips.clear()
       ])
       await db.books.bulkPut(snapshot.books)
       await db.volumes.bulkPut(snapshot.volumes)
@@ -318,6 +495,9 @@ export async function importSnapshot(snapshot: RestoreSnapshot): Promise<void> {
       await db.papers.bulkPut(snapshot.papers)
       await db.repairOrders.bulkPut(snapshot.repairOrders)
       await db.bindings.bulkPut(snapshot.bindings)
+      await db.workshops.bulkPut(snapshot.workshops ?? [])
+      await db.sendRegistrations.bulkPut(snapshot.sendRegistrations ?? [])
+      await db.returnSlips.bulkPut(snapshot.returnSlips ?? [])
     }
   )
 }
@@ -325,7 +505,7 @@ export async function importSnapshot(snapshot: RestoreSnapshot): Promise<void> {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.books, db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings],
+    [db.books, db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings, db.workshops, db.sendRegistrations, db.returnSlips],
     async () => {
       await Promise.all([
         db.books.clear(),
@@ -333,7 +513,10 @@ export async function clearAllTables(): Promise<void> {
         db.leaves.clear(),
         db.papers.clear(),
         db.repairOrders.clear(),
-        db.bindings.clear()
+        db.bindings.clear(),
+        db.workshops.clear(),
+        db.sendRegistrations.clear(),
+        db.returnSlips.clear()
       ])
     }
   )
@@ -345,18 +528,22 @@ export async function resetDatabase(): Promise<void> {
 }
 
 export async function countAll(): Promise<Record<string, number>> {
-  const [books, volumes, leaves, papers, repairOrders, bindings] = await Promise.all([
-    db.books.count(),
-    db.volumes.count(),
-    db.leaves.count(),
-    db.papers.count(),
-    db.repairOrders.count(),
-    db.bindings.count()
-  ])
-  return { books, volumes, leaves, papers, repairOrders, bindings }
+  const [books, volumes, leaves, papers, repairOrders, bindings, workshops, sendRegistrations, returnSlips] =
+    await Promise.all([
+      db.books.count(),
+      db.volumes.count(),
+      db.leaves.count(),
+      db.papers.count(),
+      db.repairOrders.count(),
+      db.bindings.count(),
+      db.workshops.count(),
+      db.sendRegistrations.count(),
+      db.returnSlips.count()
+    ])
+  return { books, volumes, leaves, papers, repairOrders, bindings, workshops, sendRegistrations, returnSlips }
 }
 
-/** 级联删除古籍 → 册次 → 书叶 → 补纸 / 工序 / 装订 */
+/** 级联删除古籍 → 册次 → 书叶 → 补纸 / 工序 / 装订 / 送修登记 / 回件单 */
 export async function removeBookCascade(bookId: string): Promise<void> {
   const volumeIds = (await db.volumes.where('bookId').equals(bookId).toArray()).map((row) => row.id)
   const leafIds = volumeIds.length
@@ -364,11 +551,12 @@ export async function removeBookCascade(bookId: string): Promise<void> {
     : []
   await db.transaction(
     'rw',
-    [db.books, db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings],
+    [db.books, db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings, db.sendRegistrations, db.returnSlips],
     async () => {
       if (leafIds.length > 0) {
         await db.papers.where('leafId').anyOf(leafIds).delete()
         await db.repairOrders.where('leafId').anyOf(leafIds).delete()
+        await cleanupWorkshopRecords(leafIds)
       }
       if (volumeIds.length > 0) {
         await db.leaves.where('volumeId').anyOf(volumeIds).delete()
@@ -380,16 +568,17 @@ export async function removeBookCascade(bookId: string): Promise<void> {
   )
 }
 
-/** 级联删除册次 → 书叶 → 补纸 / 工序 / 装订 */
+/** 级联删除册次 → 书叶 → 补纸 / 工序 / 装订 / 送修登记 / 回件单 */
 export async function removeVolumeCascade(volumeId: string): Promise<void> {
   const leafIds = (await db.leaves.where('volumeId').equals(volumeId).toArray()).map((row) => row.id)
   await db.transaction(
     'rw',
-    [db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings],
+    [db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings, db.sendRegistrations, db.returnSlips],
     async () => {
       if (leafIds.length > 0) {
         await db.papers.where('leafId').anyOf(leafIds).delete()
         await db.repairOrders.where('leafId').anyOf(leafIds).delete()
+        await cleanupWorkshopRecords(leafIds)
       }
       await db.leaves.where('volumeId').equals(volumeId).delete()
       await db.bindings.where('volumeId').equals(volumeId).delete()
@@ -398,11 +587,57 @@ export async function removeVolumeCascade(volumeId: string): Promise<void> {
   )
 }
 
-/** 级联删除书叶 → 补纸 / 工序 */
+/** 从送修登记与回件单中移除指定书叶的引用（级联删除时清理孤儿引用） */
+async function cleanupWorkshopRecords(leafIds: string[]): Promise<void> {
+  const idSet = new Set(leafIds)
+  const now = Date.now()
+  const sends = await db.sendRegistrations.toArray()
+  for (const send of sends) {
+    const next = send.leafIds.filter((id) => !idSet.has(id))
+    if (next.length !== send.leafIds.length) {
+      send.leafIds = next
+      send.updatedAt = now
+      await db.sendRegistrations.put(send)
+    }
+  }
+  const slips = await db.returnSlips.toArray()
+  for (const slip of slips) {
+    const next = slip.leafIds.filter((id) => !idSet.has(id))
+    if (next.length !== slip.leafIds.length) {
+      slip.leafIds = next
+      slip.updatedAt = now
+      await db.returnSlips.put(slip)
+    }
+  }
+}
+
+/** 级联删除书叶 → 补纸 / 工序 / 送修登记 / 回件单 */
 export async function removeLeafCascade(leafId: string): Promise<void> {
-  await db.transaction('rw', [db.leaves, db.papers, db.repairOrders], async () => {
-    await db.papers.where('leafId').equals(leafId).delete()
-    await db.repairOrders.where('leafId').equals(leafId).delete()
-    await db.leaves.delete(leafId)
-  })
+  await db.transaction(
+    'rw',
+    [db.leaves, db.papers, db.repairOrders, db.sendRegistrations, db.returnSlips],
+    async () => {
+      await db.papers.where('leafId').equals(leafId).delete()
+      await db.repairOrders.where('leafId').equals(leafId).delete()
+      // 从送修登记的 leafIds 中移除该书叶
+      const sends = await db.sendRegistrations.toArray()
+      for (const send of sends) {
+        if (send.leafIds.includes(leafId)) {
+          send.leafIds = send.leafIds.filter((id) => id !== leafId)
+          send.updatedAt = Date.now()
+          await db.sendRegistrations.put(send)
+        }
+      }
+      // 从回件单的 leafIds 中移除该书叶
+      const slips = await db.returnSlips.toArray()
+      for (const slip of slips) {
+        if (slip.leafIds.includes(leafId)) {
+          slip.leafIds = slip.leafIds.filter((id) => id !== leafId)
+          slip.updatedAt = Date.now()
+          await db.returnSlips.put(slip)
+        }
+      }
+      await db.leaves.delete(leafId)
+    }
+  )
 }

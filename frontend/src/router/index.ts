@@ -34,6 +34,12 @@ const routes: RouteRecordRaw[] = [
     meta: { title: '修复工序记录', icon: 'Tools' }
   },
   {
+    path: '/workshop',
+    name: 'workshop-track',
+    component: () => import('@/pages/WorkshopTrack.vue'),
+    meta: { title: '馆外托裱跟踪', icon: 'Shop' }
+  },
+  {
     path: '/export',
     name: 'export-view',
     component: () => import('@/pages/ExportView.vue'),

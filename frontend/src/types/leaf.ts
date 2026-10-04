@@ -23,6 +23,8 @@ export interface Leaf {
   phValue: number;
   /** 当前状态 */
   state: LeafState;
+  /** 只读：老档案在外叶无法回填批次时标记为只读，不可编辑 */
+  readOnly: boolean;
   createdAt: number;
   updatedAt: number;
 }
@@ -104,5 +106,6 @@ export function createEmptyLeafDraft(volumeId: string, leafNo: number): LeafDraf
     damageAreaCm2: 4,
     phValue: 6.8,
     state: 'pending',
+    readOnly: false,
   };
 }
