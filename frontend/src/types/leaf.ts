@@ -9,6 +9,22 @@ export type DamageType = 'worm' | 'acid' | 'fibrin' | 'loss' | 'stain';
 /** 书叶状态：待修 / 修复中 / 已修复 */
 export type LeafState = 'pending' | 'repairing' | 'repaired';
 
+/**
+ * 馆外送修标记：书叶送往馆外修书工坊整册托裱期间的在途信息。
+ * 老档案里在外的叶没有批次归属（batchId 为 null），
+ * 升级时按送修日期和工坊回填，补不上的 readonly 只读保留。
+ */
+export interface LeafOutsource {
+  /** 送往的工坊 */
+  workshop: string;
+  /** 送修日期 yyyy-MM-dd */
+  sentDate: string;
+  /** 归属送修批次 id；老档案未归属为 null */
+  batchId: string | null;
+  /** 升级时补不上批次归属的老档案只读保留，不再改动 */
+  readonly: boolean;
+}
+
 export interface Leaf {
   id: string;
   /** 所属册次 id */
@@ -23,6 +39,8 @@ export interface Leaf {
   phValue: number;
   /** 当前状态 */
   state: LeafState;
+  /** 馆外送修在途标记；在室为 null/undefined */
+  outsource?: LeafOutsource | null;
   createdAt: number;
   updatedAt: number;
 }

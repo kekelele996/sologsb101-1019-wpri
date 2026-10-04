@@ -200,6 +200,16 @@ function paperText(leafId: string): string {
   return `${PAPER_TYPE_LABEL[paper.paperType]} · ΔE ${paper.deltaE}`
 }
 
+/** 老档案里补不上批次归属的在外书叶：只读保留，不再改动 */
+function isReadonlyOut(leaf: Leaf): boolean {
+  return Boolean(leaf.outsource?.readonly)
+}
+
+/** 批量改状态的可选行：只读老档案不可勾选 */
+function selectableRow(row: Leaf): boolean {
+  return !isReadonlyOut(row)
+}
+
 function phTag(ph: number): { label: string; color: string } {
   return phLevel(ph)
 }
@@ -307,7 +317,7 @@ function stateColor(state: string): string {
         />
 
         <el-table v-else :data="rows" size="small" border @selection-change="handleSelectionChange">
-          <el-table-column type="selection" width="44" />
+          <el-table-column type="selection" width="44" :selectable="selectableRow" />
           <el-table-column prop="leafNo" label="叶号" width="80" sortable />
           <el-table-column label="破损类型" width="150">
             <template #default="{ row }">
@@ -330,6 +340,17 @@ function stateColor(state: string): string {
               </el-tag>
             </template>
           </el-table-column>
+          <el-table-column label="馆外" width="180">
+            <template #default="{ row }">
+              <template v-if="row.outsource">
+                <el-tag type="warning" effect="plain" size="small" round>在外 · {{ row.outsource.workshop }}</el-tag>
+                <el-tag v-if="row.outsource.readonly" type="info" effect="plain" size="small" round style="margin-left: 4px">
+                  只读
+                </el-tag>
+              </template>
+              <span v-else class="gb-muted">在室</span>
+            </template>
+          </el-table-column>
           <el-table-column label="补纸" width="140">
             <template #default="{ row }">
               <span class="gb-muted">{{ paperText(row.id) }}</span>
@@ -343,10 +364,10 @@ function stateColor(state: string): string {
           </el-table-column>
           <el-table-column label="操作" min-width="260">
             <template #default="{ row }">
-              <el-button size="small" text type="primary" @click="advance(row)">推进状态</el-button>
+              <el-button size="small" text type="primary" :disabled="isReadonlyOut(row)" @click="advance(row)">推进状态</el-button>
               <el-button size="small" text @click="addLeafRecord(row)">叠加破损</el-button>
-              <el-button size="small" text :disabled="locked" :icon="Edit" @click="openEdit(row)">编辑</el-button>
-              <el-button size="small" text type="danger" :icon="Delete" @click="remove(row)">删除</el-button>
+              <el-button size="small" text :disabled="locked || isReadonlyOut(row)" :icon="Edit" @click="openEdit(row)">编辑</el-button>
+              <el-button size="small" text type="danger" :disabled="isReadonlyOut(row)" :icon="Delete" @click="remove(row)">删除</el-button>
             </template>
           </el-table-column>
         </el-table>

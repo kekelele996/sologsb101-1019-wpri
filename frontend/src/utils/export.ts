@@ -8,12 +8,15 @@ import type { Leaf } from '@/types/leaf'
 import type { Paper } from '@/types/paper'
 import type { RepairOrder } from '@/types/repairOrder'
 import type { Binding } from '@/types/binding'
+import type { OutsourceBatch } from '@/types/outsourceBatch'
+import type { ReturnSlip } from '@/types/returnSlip'
 import { BOOK_LEVEL_LABEL } from '@/types/book'
 import { BINDING_TYPE_LABEL, VOLUME_STATE_LABEL } from '@/types/volume'
 import { DAMAGE_TYPE_LABEL, LEAF_STATE_LABEL } from '@/types/leaf'
 import { PAPER_TYPE_LABEL, deltaELevel } from '@/types/paper'
 import { REPAIR_NAME_LABEL } from '@/types/repairOrder'
 import { BINDING_VERDICT_LABEL } from '@/types/binding'
+import { OUTSOURCE_STATE_LABEL, isBatchOverdue, reconcileBatch } from '@/types/outsourceBatch'
 import type { RestoreSnapshot } from './db'
 
 /** 触发浏览器下载 */
@@ -55,6 +58,8 @@ export interface ExportContext {
   papers: Paper[]
   repairOrders: RepairOrder[]
   bindings: Binding[]
+  outsourceBatches: OutsourceBatch[]
+  returnSlips: ReturnSlip[]
 }
 
 /** 验收归档清单文本：按古籍 → 册次 → 书叶 → 工序展开 */
@@ -84,6 +89,20 @@ export function buildArchiveReport(context: ExportContext): string {
             : '尚未装订'
         }`
       )
+      // 馆外送修：本室登记与工坊回件单逐叶对账后的派生状态
+      const batches = context.outsourceBatches.filter((item) => item.volumeId === volume.id)
+      batches.forEach((batch) => {
+        const registeredSlips = context.returnSlips.filter(
+          (slip) => slip.batchId === batch.id && slip.registerState === 'registered'
+        )
+        const recon = reconcileBatch(batch, registeredSlips)
+        const hit = batch.leafNos.filter((leafNo) => recon.returnedLeafNos.includes(leafNo)).length
+        const overdue = isBatchOverdue(batch, recon) ? '　已逾期' : ''
+        const extra = recon.extraLeafNos.length > 0 ? `　待认领 ${recon.extraLeafNos.join('、')} 叶` : ''
+        lines.push(
+          `      馆外送修：${batch.workshop}　送修 ${batch.sentDate}　约定 ${batch.dueDate}　送出 ${batch.leafNos.join('、')} 叶　已回 ${hit} 叶　${OUTSOURCE_STATE_LABEL[recon.state]}${overdue}${extra}`
+        )
+      })
       leaves.forEach((leaf) => {
         const orders = context.repairOrders.filter((order) => order.leafId === leaf.id)
         const done = orders.filter((order) => order.state === 'done').length

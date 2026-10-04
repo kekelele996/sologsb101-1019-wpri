@@ -14,6 +14,7 @@ import { useLeafStats } from '@/hooks/useLeafStats'
 import { useBookStore } from '@/stores/bookStore'
 import { useLeafStore } from '@/stores/leafStore'
 import { useRepairStore } from '@/stores/repairStore'
+import { useOutsourceStore } from '@/stores/outsourceStore'
 import {
   BINDING_METHOD_OPTIONS,
   BINDING_VERDICT_COLOR,
@@ -48,6 +49,7 @@ import {
 const bookStore = useBookStore()
 const leafStore = useLeafStore()
 const repairStore = useRepairStore()
+const outsourceStore = useOutsourceStore()
 const { totals } = useLeafStats()
 const bindingTable = useIdbTable<Binding>((database) => database.bindings, { sortByUpdatedAt: false })
 const paperTable = useIdbTable<Paper>((database) => database.papers, { sortByUpdatedAt: false })
@@ -93,7 +95,9 @@ const context = computed(() => ({
   leaves: leafStore.leaves,
   papers: paperTable.rows.value,
   repairOrders: repairStore.orders,
-  bindings: bindingTable.rows.value
+  bindings: bindingTable.rows.value,
+  outsourceBatches: outsourceStore.batches,
+  returnSlips: outsourceStore.slips
 }))
 
 const archiveText = computed(() => buildArchiveReport(context.value))
@@ -208,7 +212,13 @@ async function handleFile(event: Event): Promise<void> {
     return
   }
   await importSnapshot(parsed as RestoreSnapshot)
-  await Promise.all([bookStore.loadBooks(), bookStore.loadVolumes(), leafStore.loadLeaves(), repairStore.loadOrders()])
+  await Promise.all([
+    bookStore.loadBooks(),
+    bookStore.loadVolumes(),
+    leafStore.loadLeaves(),
+    repairStore.loadOrders(),
+    outsourceStore.loadAll()
+  ])
   ElMessage.success('导入完成，数据已覆盖')
 }
 
@@ -223,7 +233,13 @@ async function handleReset(): Promise<void> {
     return
   }
   await resetDatabase()
-  await Promise.all([bookStore.loadBooks(), bookStore.loadVolumes(), leafStore.loadLeaves(), repairStore.loadOrders()])
+  await Promise.all([
+    bookStore.loadBooks(),
+    bookStore.loadVolumes(),
+    leafStore.loadLeaves(),
+    repairStore.loadOrders(),
+    outsourceStore.loadAll()
+  ])
   ElMessage.success('已清空并重新载入演示数据')
 }
 
@@ -328,7 +344,7 @@ function verdictColor(verdict: string): string {
         <el-card shadow="never" style="margin-top: 16px">
           <template #header>整库导出</template>
           <p class="gb-muted">
-            导出文件包含 6 张业务表全量数据与结构版本号，可在其他设备通过「导入 JSON」还原。
+            导出文件包含 8 张业务表全量数据与结构版本号，可在其他设备通过「导入 JSON」还原（兼容缺少送修两表的古早备份）。
           </p>
           <div class="gb-toolbar">
             <el-button :icon="Download" @click="handleExport">JSON 备份</el-button>
